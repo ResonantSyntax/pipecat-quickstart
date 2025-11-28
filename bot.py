@@ -45,7 +45,7 @@ logger.info("✅ Silero VAD model loaded")
 
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import LLMRunFrame, TextFrame, TranscriptionFrame
+from pipecat.frames.frames import LLMRunFrame
 
 logger.info("Loading pipeline components...")
 from pipecat.pipeline.pipeline import Pipeline
@@ -53,7 +53,6 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.azure.tts import AzureTTSService
@@ -63,9 +62,817 @@ from pipecat.services.heygen.video import HeyGenVideoService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 
+logger.info("Loading Pipecat Flows...")
+from pipecat_flows import FlowManager, NodeConfig, FlowsFunctionSchema, FlowArgs
+from datetime import datetime
+from typing import Optional
+try:
+    from dateutil import parser as date_parser
+    DATEUTIL_AVAILABLE = True
+except ImportError:
+    DATEUTIL_AVAILABLE = False
+    logger.warning("python-dateutil not available. Date parsing will be limited.")
+
 logger.info("✅ All components loaded successfully!")
 
 load_dotenv(override=True)
+
+
+# ============================================================================
+# Helper Functions for Progress Tracking
+# ============================================================================
+
+def get_collection_progress(flow_manager: FlowManager) -> dict:
+    """Get the current progress of data collection.
+    
+    Returns:
+        Dictionary with status of each required field
+    """
+    return {
+        "name_collected": "first_name" in flow_manager.state and "surname" in flow_manager.state,
+        "dob_collected": "date_of_birth" in flow_manager.state,
+        "preference_collected": "reading_type" in flow_manager.state,
+    }
+
+
+def get_progress_message(flow_manager: FlowManager) -> str:
+    """Generate a progress message for the user.
+    
+    Returns:
+        String describing what information has been collected
+    """
+    progress = get_collection_progress(flow_manager)
+    collected = []
+    if progress["name_collected"]:
+        collected.append("name")
+    if progress["dob_collected"]:
+        collected.append("date of birth")
+    if progress["preference_collected"]:
+        collected.append("reading preference")
+    
+    if not collected:
+        return "We haven't collected any information yet."
+    return f"Great! I have your {', '.join(collected)}."
+
+
+# ============================================================================
+# Function Handlers for Data Collection (with Validation)
+# ============================================================================
+
+async def record_name_and_surname(
+    args: FlowArgs, flow_manager: FlowManager
+) -> tuple[str, Optional[NodeConfig]]:
+    """Record the user's first name and surname with validation.
+    
+    Args:
+        args: Contains 'first_name' and 'surname' keys
+        flow_manager: FlowManager instance for state management
+        
+    Returns:
+        Tuple of (result message, next node or None)
+    """
+    first_name = args.get("first_name", "").strip()
+    surname = args.get("surname", "").strip()
+    
+    # Validation: Check if names are provided and reasonable length
+    if not first_name or len(first_name) < 1:
+        return "I'm sorry, I didn't catch your first name clearly. Could you tell me your first name again?", None
+    
+    if not surname or len(surname) < 1:
+        return "I'm sorry, I didn't catch your surname clearly. Could you tell me your last name again?", None
+    
+    # Additional validation: Check for obviously invalid inputs
+    if len(first_name) > 50 or len(surname) > 50:
+        return "That name seems unusually long. Could you repeat your first and last name for me?", None
+    
+    # Save to state
+    flow_manager.state["first_name"] = first_name
+    flow_manager.state["surname"] = surname
+    flow_manager.state["full_name"] = f"{first_name} {surname}".strip()
+    
+    logger.info(f"Recorded name: {flow_manager.state['full_name']}")
+    
+    # Return acknowledgment message that will be spoken, then transition
+    acknowledgment = f"Thank you, {first_name}. I've noted your name. Now, could you tell me your date of birth?"
+    
+    # Transition to date of birth collection node
+    return acknowledgment, create_collect_dob_node()
+
+
+async def record_date_of_birth(
+    args: FlowArgs, flow_manager: FlowManager
+) -> tuple[str, Optional[NodeConfig]]:
+    """Record the user's date of birth with validation and parsing.
+    
+    Args:
+        args: Contains 'date_of_birth' key (format: YYYY-MM-DD or natural language)
+        flow_manager: FlowManager instance for state management
+        
+    Returns:
+        Tuple of (result message, next node or None)
+    """
+    dob_raw = args.get("date_of_birth", "").strip()
+    
+    # Validation: Check if date is provided
+    if not dob_raw:
+        return "I'm sorry, I didn't catch that date clearly. Could you tell me your date of birth again?", None
+    
+    # Try to parse the date (Recommendation 4: Date Parsing)
+    dob_parsed = None
+    dob_iso = None
+    
+    if DATEUTIL_AVAILABLE:
+        try:
+            dob_parsed = date_parser.parse(dob_raw)
+            dob_iso = dob_parsed.isoformat()
+            # Validate reasonable date range (not in the future, not too old)
+            current_year = datetime.now().year
+            if dob_parsed.year > current_year:
+                return "That date seems to be in the future. Could you tell me your date of birth again?", None
+            if dob_parsed.year < 1900:
+                return "That date seems quite old. Could you confirm your date of birth?", None
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Could not parse date: {dob_raw}, error: {e}")
+            # Continue with raw date if parsing fails
+    
+    # Save to state (both raw and parsed - Recommendation 4)
+    flow_manager.state["date_of_birth"] = dob_raw
+    if dob_iso:
+        flow_manager.state["date_of_birth_iso"] = dob_iso
+        flow_manager.state["date_of_birth_parsed"] = dob_parsed.isoformat()
+        logger.info(f"Recorded date of birth: {dob_raw} (parsed: {dob_iso})")
+    else:
+        logger.info(f"Recorded date of birth (raw only): {dob_raw}")
+    
+    # Return acknowledgment message that will be spoken, then transition
+    acknowledgment = f"Perfect! I've noted your date of birth as {dob_raw}. Now, what type of reading are you interested in? I offer tarot, numerology, or astrology readings."
+    
+    # Transition to reading preference collection node
+    return acknowledgment, create_collect_preference_node()
+
+
+async def record_reading_preference(
+    args: FlowArgs, flow_manager: FlowManager
+) -> tuple[str, Optional[NodeConfig]]:
+    """Record the user's reading preference (without confirmation yet).
+    
+    Args:
+        args: Contains 'reading_type' key (tarot, numerology, or astrology)
+        flow_manager: FlowManager instance for state management
+        
+    Returns:
+        Tuple of (result message, next node for confirmation)
+    """
+    reading_type = args.get("reading_type", "").strip().lower()
+    
+    # Normalize reading type
+    if "tarot" in reading_type:
+        reading_type = "tarot"
+    elif "numerology" in reading_type:
+        reading_type = "numerology"
+    elif "astrology" in reading_type or "astrological" in reading_type:
+        reading_type = "astrology"
+    else:
+        # If unclear, ask for clarification
+        return "I want to make sure I understand correctly. Are you interested in a tarot, numerology, or astrology reading?", None
+    
+    # Save to state temporarily (will be confirmed in confirmation node)
+    flow_manager.state["reading_type_pending"] = reading_type
+    
+    logger.info(f"Recorded reading preference (pending confirmation): {reading_type}")
+    
+    # Return acknowledgment and ask for confirmation
+    acknowledgment = f"Wonderful! So you'd like a {reading_type} reading. Is that correct?"
+    
+    # Transition to confirmation node (Recommendation 5: Confirmation)
+    return acknowledgment, create_confirm_preference_node()
+
+
+async def confirm_reading_preference(
+    args: FlowArgs, flow_manager: FlowManager
+) -> tuple[str, NodeConfig]:
+    """Confirm the reading preference and route to appropriate node.
+    
+    Args:
+        args: Contains 'confirmed' key (true/false/yes/no)
+        flow_manager: FlowManager instance for state management
+        
+    Returns:
+        Tuple of (result message, next node)
+    """
+    confirmed = args.get("confirmed", "").strip().lower()
+    reading_type = flow_manager.state.get("reading_type_pending", "")
+    
+    # Check if user confirmed
+    if confirmed in ["no", "nope", "false", "incorrect", "wrong", "change", "different"]:
+        # User wants to change - go back to preference collection
+        flow_manager.state.pop("reading_type_pending", None)
+        return "No problem! Let me ask again. What type of reading are you interested in: tarot, numerology, or astrology?", create_collect_preference_node()
+    
+    # User confirmed - proceed
+    if not reading_type:
+        # Fallback if reading_type_pending was lost
+        reading_type = flow_manager.state.get("reading_type", "tarot")
+    
+    # Normalize and route (Recommendation 7: Pass flow_manager to access state)
+    if reading_type == "tarot":
+        next_node = create_tarot_node(flow_manager)
+    elif reading_type == "numerology":
+        next_node = create_numerology_node(flow_manager)
+    elif reading_type == "astrology":
+        next_node = create_astrology_node(flow_manager)
+    else:
+        # Default fallback
+        reading_type = "tarot"
+        next_node = create_tarot_node(flow_manager)
+        logger.warning(f"Unexpected reading type, defaulting to tarot")
+    
+    # Save confirmed reading type
+    flow_manager.state["reading_type"] = reading_type
+    flow_manager.state.pop("reading_type_pending", None)
+    
+    logger.info(f"Confirmed reading preference: {reading_type}")
+    
+    # Return acknowledgment and transition to reading
+    acknowledgment = f"Perfect! Let's begin your {reading_type} reading. I'm so excited to share this journey with you."
+    
+    # Transition to reading node
+    return acknowledgment, next_node
+
+
+async def handle_recovery(
+    args: FlowArgs, flow_manager: FlowManager
+) -> tuple[str, Optional[NodeConfig]]:
+    """Handle recovery from errors or user requests to start over.
+    
+    Args:
+        args: Contains 'action' key (restart, continue, or specific field to re-enter)
+        flow_manager: FlowManager instance for state management
+        
+    Returns:
+        Tuple of (result message, next node)
+    """
+    action = args.get("action", "").strip().lower()
+    progress = get_collection_progress(flow_manager)
+    
+    if "restart" in action or "start over" in action or "begin again" in action:
+        # Clear all state and restart
+        flow_manager.state.clear()
+        logger.info("User requested restart - clearing all state")
+        return "Of course! Let's start fresh. I'm Luna, and I'm here to help you explore a reading.", create_greeting_node()
+    
+    elif "name" in action or "first name" in action or "surname" in action:
+        # Re-enter name
+        flow_manager.state.pop("first_name", None)
+        flow_manager.state.pop("surname", None)
+        flow_manager.state.pop("full_name", None)
+        return "No problem! Let's get your name again. What's your first name and surname?", create_collect_name_node()
+    
+    elif "date" in action or "birth" in action or "dob" in action:
+        # Re-enter date of birth
+        flow_manager.state.pop("date_of_birth", None)
+        flow_manager.state.pop("date_of_birth_iso", None)
+        flow_manager.state.pop("date_of_birth_parsed", None)
+        return "Of course! What's your date of birth?", create_collect_dob_node()
+    
+    elif "reading" in action or "preference" in action or "type" in action:
+        # Re-enter reading preference
+        flow_manager.state.pop("reading_type", None)
+        flow_manager.state.pop("reading_type_pending", None)
+        return "Sure! What type of reading are you interested in: tarot, numerology, or astrology?", create_collect_preference_node()
+    
+    else:
+        # Continue from where we left off
+        if not progress["name_collected"]:
+            return "Let's continue. What's your first name and surname?", create_collect_name_node()
+        elif not progress["dob_collected"]:
+            return "Great! Now, what's your date of birth?", create_collect_dob_node()
+        elif not progress["preference_collected"]:
+            return "Perfect! What type of reading are you interested in: tarot, numerology, or astrology?", create_collect_preference_node()
+        else:
+            # All collected, proceed to reading (Recommendation 7: Pass flow_manager)
+            reading_type = flow_manager.state.get("reading_type", "tarot")
+            if reading_type == "tarot":
+                return "Let's continue with your tarot reading.", create_tarot_node(flow_manager)
+            elif reading_type == "numerology":
+                return "Let's continue with your numerology reading.", create_numerology_node(flow_manager)
+            else:
+                return "Let's continue with your astrology reading.", create_astrology_node(flow_manager)
+
+
+# ============================================================================
+# Node Creation Functions (Sequential Flow - Recommendation 1)
+# ============================================================================
+
+async def proceed_to_name_collection(
+    args: FlowArgs, flow_manager: FlowManager
+) -> tuple[str, NodeConfig]:
+    """Transition from greeting to name collection.
+    
+    Args:
+        args: Not used, but required by handler signature
+        flow_manager: FlowManager instance
+        
+    Returns:
+        Tuple of (result message, next node)
+    """
+    # Return empty message - the next node will ask for the name
+    return "", create_collect_name_node()
+
+
+def create_greeting_node(user_name: str = None) -> NodeConfig:
+    """Create the initial greeting node.
+    
+    This is the entry point that welcomes the user and transitions to name collection.
+    
+    Args:
+        user_name: Optional user name for personalized greeting
+        
+    Returns:
+        NodeConfig for greeting
+    """
+    # Get time of day for context-aware greeting
+    current_hour = datetime.now().hour
+    if current_hour < 12:
+        time_greeting = "Good morning"
+    elif current_hour < 17:
+        time_greeting = "Good afternoon"
+    else:
+        time_greeting = "Good evening"
+    
+    # Build personalized greeting message that includes asking for name
+    if user_name:
+        greeting_content = f"{time_greeting}, {user_name}! I'm Luna, and I'm so grateful you've chosen to explore a reading with me today. To provide you with the most meaningful reading, I'll need to collect a few details. Let's start with your name - could you tell me your first name and surname?"
+    else:
+        greeting_content = f"{time_greeting}! I'm Luna, and I'm so grateful you've chosen to explore a reading with me today. To provide you with the most meaningful reading, I'll need to collect a few details. Let's start with your name - could you tell me your first name and surname?"
+    
+    # Name function for the greeting node (so user doesn't have to speak first)
+    name_function = FlowsFunctionSchema(
+        name="record_name_and_surname",
+        description="MANDATORY: Call this function immediately when the user provides their first name AND surname. Extract both names from their response and call this function. Do not wait or ask for confirmation - call it as soon as you have both names.",
+        required=["first_name", "surname"],
+        handler=record_name_and_surname,
+        properties={
+            "first_name": {
+                "type": "string",
+                "description": "The user's first name"
+            },
+            "surname": {
+                "type": "string",
+                "description": "The user's last name or surname"
+            }
+        },
+    )
+    
+    # Recovery function available globally
+    recovery_function = FlowsFunctionSchema(
+        name="handle_recovery",
+        description="Use this if the user wants to start over, correct information, or if there's any confusion. The user might say things like 'start over', 'that's wrong', 'change my name', etc.",
+        required=["action"],
+        handler=handle_recovery,
+        properties={
+            "action": {
+                "type": "string",
+                "description": "The action the user wants: 'restart', 'change name', 'change date', 'change reading type', or 'continue'"
+            }
+        },
+    )
+    
+    return NodeConfig(
+        name="greeting",
+        role_messages=[
+            {
+                "role": "system",
+                "content": "You are Luna, a warm and intuitive psychic guide. Your words will be spoken aloud, so speak naturally and conversationally—avoid special characters, emojis, or bullet points that don't translate well to voice. Keep your responses brief and heartfelt, typically one to three sentences. Listen deeply to what the seeker shares and respond with genuine empathy and intuitive wisdom, making them feel truly heard and understood."
+            }
+        ],
+        task_messages=[
+            {
+                "role": "system",
+                "content": f"""{greeting_content}
+
+CRITICAL: When the user provides their name, you MUST immediately call the record_name_and_surname function with their first name and surname. After calling the function, the function will return an acknowledgment message - you MUST speak that acknowledgment message to the user."""
+            }
+        ],
+        functions=[name_function, recovery_function],
+        respond_immediately=True,
+    )
+
+
+def create_collect_name_node() -> NodeConfig:
+    """Create a node specifically for collecting the user's name.
+    
+    Returns:
+        NodeConfig for name collection
+    """
+    name_function = FlowsFunctionSchema(
+        name="record_name_and_surname",
+        description="MANDATORY: Call this function immediately when the user provides their first name AND surname. Extract both names from their response and call this function. Do not wait or ask for confirmation - call it as soon as you have both names.",
+        required=["first_name", "surname"],
+        handler=record_name_and_surname,
+        properties={
+            "first_name": {
+                "type": "string",
+                "description": "The user's first name"
+            },
+            "surname": {
+                "type": "string",
+                "description": "The user's last name or surname"
+            }
+        },
+    )
+    
+    recovery_function = FlowsFunctionSchema(
+        name="handle_recovery",
+        description="Use this if the user wants to start over, correct information, or if there's any confusion.",
+        required=["action"],
+        handler=handle_recovery,
+        properties={
+            "action": {
+                "type": "string",
+                "description": "The action the user wants: 'restart', 'change name', or 'continue'"
+            }
+        },
+    )
+    
+    return NodeConfig(
+        name="collect_name",
+        role_messages=[
+            {
+                "role": "system",
+                "content": "You are Luna, a warm and intuitive psychic guide. Your words will be spoken aloud, so speak naturally and conversationally—avoid special characters, emojis, or bullet points that don't translate well to voice. Keep your responses brief and heartfelt, typically one to three sentences."
+            }
+        ],
+        task_messages=[
+            {
+                "role": "system",
+                "content": """Ask the user for their first name and surname. Be warm and conversational. 
+
+CRITICAL: When the user provides their name, you MUST immediately call the record_name_and_surname function with their first name and surname. After calling the function, the function will return an acknowledgment message - you MUST speak that acknowledgment message to the user. If the user only provides one name, ask for the other before calling the function."""
+            }
+        ],
+        functions=[name_function, recovery_function],
+        respond_immediately=True,  # Respond immediately to prompt the user
+    )
+
+
+def create_collect_dob_node() -> NodeConfig:
+    """Create a node specifically for collecting the user's date of birth.
+    
+    Returns:
+        NodeConfig for date of birth collection
+    """
+    dob_function = FlowsFunctionSchema(
+        name="record_date_of_birth",
+        description="MANDATORY: Call this function immediately when the user provides their date of birth. Accept dates in any format (e.g., 'January 15, 1990', '1990-01-15', '01/15/1990'). Extract the date from their response and call this function right away. Do not wait or ask for confirmation.",
+        required=["date_of_birth"],
+        handler=record_date_of_birth,
+        properties={
+            "date_of_birth": {
+                "type": "string",
+                "description": "The user's date of birth in any format they provide"
+            }
+        },
+    )
+    
+    recovery_function = FlowsFunctionSchema(
+        name="handle_recovery",
+        description="Use this if the user wants to start over, correct information, or if there's any confusion.",
+        required=["action"],
+        handler=handle_recovery,
+        properties={
+            "action": {
+                "type": "string",
+                "description": "The action the user wants: 'restart', 'change date', 'change name', or 'continue'"
+            }
+        },
+    )
+    
+    return NodeConfig(
+        name="collect_dob",
+        role_messages=[
+            {
+                "role": "system",
+                "content": "You are Luna, a warm and intuitive psychic guide. Your words will be spoken aloud, so speak naturally and conversationally—avoid special characters, emojis, or bullet points that don't translate well to voice. Keep your responses brief and heartfelt, typically one to three sentences."
+            }
+        ],
+        task_messages=[
+            {
+                "role": "system",
+                "content": """Now ask the user for their date of birth. Be warm and conversational. Accept any date format they provide.
+
+CRITICAL: When the user provides their date of birth, you MUST immediately call the record_date_of_birth function with the date they provided. After calling the function, the function will return an acknowledgment message - you MUST speak that acknowledgment message to the user."""
+            }
+        ],
+        functions=[dob_function, recovery_function],
+        respond_immediately=True,
+    )
+
+
+def create_collect_preference_node() -> NodeConfig:
+    """Create a node specifically for collecting the user's reading preference.
+    
+    Returns:
+        NodeConfig for reading preference collection
+    """
+    preference_function = FlowsFunctionSchema(
+        name="record_reading_preference",
+        description="MANDATORY: Call this function immediately when the user indicates they want a tarot, numerology, or astrology reading. Extract their choice from their response and call this function right away. Do not wait or ask for confirmation.",
+        required=["reading_type"],
+        handler=record_reading_preference,
+        properties={
+            "reading_type": {
+                "type": "string",
+                "description": "The type of reading the user wants: 'tarot', 'numerology', or 'astrology'"
+            }
+        },
+    )
+    
+    recovery_function = FlowsFunctionSchema(
+        name="handle_recovery",
+        description="Use this if the user wants to start over, correct information, or if there's any confusion.",
+        required=["action"],
+        handler=handle_recovery,
+        properties={
+            "action": {
+                "type": "string",
+                "description": "The action the user wants: 'restart', 'change reading type', 'change name', 'change date', or 'continue'"
+            }
+        },
+    )
+    
+    return NodeConfig(
+        name="collect_preference",
+        role_messages=[
+            {
+                "role": "system",
+                "content": "You are Luna, a warm and intuitive psychic guide. Your words will be spoken aloud, so speak naturally and conversationally—avoid special characters, emojis, or bullet points that don't translate well to voice. Keep your responses brief and heartfelt, typically one to three sentences."
+            }
+        ],
+        task_messages=[
+            {
+                "role": "system",
+                "content": """Now ask the user what type of reading they're interested in: tarot, numerology, or astrology. Be warm and help them choose if they're unsure.
+
+CRITICAL: When the user indicates their reading preference (tarot, numerology, or astrology), you MUST immediately call the record_reading_preference function with their choice. After calling the function, the function will return an acknowledgment message - you MUST speak that acknowledgment message to the user."""
+            }
+        ],
+        functions=[preference_function, recovery_function],
+        respond_immediately=True,
+    )
+
+
+def create_confirm_preference_node() -> NodeConfig:
+    """Create a node for confirming the reading preference (Recommendation 5).
+    
+    Returns:
+        NodeConfig for preference confirmation
+    """
+    confirm_function = FlowsFunctionSchema(
+        name="confirm_reading_preference",
+        description="MANDATORY: Call this function immediately when the user responds to your confirmation question. If they say yes/correct/right, use 'yes'. If they say no/wrong/change/different, use 'no' or 'change'. Extract their response and call this function right away.",
+        required=["confirmed"],
+        handler=confirm_reading_preference,
+        properties={
+            "confirmed": {
+                "type": "string",
+                "description": "Whether the user confirms: 'yes', 'no', 'correct', 'wrong', 'change', etc."
+            }
+        },
+    )
+    
+    recovery_function = FlowsFunctionSchema(
+        name="handle_recovery",
+        description="Use this if the user wants to start over or correct information.",
+        required=["action"],
+        handler=handle_recovery,
+        properties={
+            "action": {
+                "type": "string",
+                "description": "The action the user wants: 'restart', 'change reading type', etc."
+            }
+        },
+    )
+    
+    return NodeConfig(
+        name="confirm_preference",
+        role_messages=[
+            {
+                "role": "system",
+                "content": "You are Luna, a warm and intuitive psychic guide. Your words will be spoken aloud, so speak naturally and conversationally—avoid special characters, emojis, or bullet points that don't translate well to voice. Keep your responses brief and heartfelt, typically one to three sentences."
+            }
+        ],
+        task_messages=[
+            {
+                "role": "system",
+                "content": """Confirm the user's reading preference by repeating it back to them and asking if that's correct. For example: 'Perfect! So you'd like a tarot reading, is that right?'
+
+CRITICAL: When the user responds (yes, no, correct, wrong, change, etc.), you MUST immediately call the confirm_reading_preference function with their response. After calling the function, the function will return an acknowledgment message - you MUST speak that acknowledgment message to the user."""
+            }
+        ],
+        functions=[confirm_function, recovery_function],
+        respond_immediately=True,
+    )
+
+
+def create_tarot_node(flow_manager: Optional[FlowManager] = None) -> NodeConfig:
+    """Create a skeleton node for tarot readings (Recommendation 7: Access State).
+    
+    Args:
+        flow_manager: Optional FlowManager to access state. If None, state will be
+                     accessed via function handlers.
+    
+    Returns:
+        NodeConfig for tarot reading flow
+    """
+    # Build personalized message using state if available
+    user_name = None
+    dob = None
+    if flow_manager:
+        user_name = flow_manager.state.get("full_name") or flow_manager.state.get("first_name")
+        dob = flow_manager.state.get("date_of_birth")
+    
+    welcome_msg = "Welcome to your tarot reading"
+    if user_name:
+        welcome_msg = f"Welcome to your tarot reading, {user_name}"
+    
+    task_content = f"""{welcome_msg}. This is a skeleton node - you can begin the tarot reading process here."""
+    
+    if user_name and dob:
+        task_content += f" You know the user's name is {user_name} and their date of birth is {dob}. Use this information to personalize the reading."
+    elif user_name:
+        task_content += f" You know the user's name is {user_name}. Use this to personalize the reading."
+    elif dob:
+        task_content += f" You know the user's date of birth is {dob}. Use this information in the reading."
+    
+    recovery_function = FlowsFunctionSchema(
+        name="handle_recovery",
+        description="Use this if the user wants to start over or go back.",
+        required=["action"],
+        handler=handle_recovery,
+        properties={
+            "action": {
+                "type": "string",
+                "description": "The action the user wants: 'restart' or 'continue'"
+            }
+        },
+    )
+    
+    return NodeConfig(
+        name="tarot_reading",
+        role_messages=[
+            {
+                "role": "system",
+                "content": "You are Luna, a warm and intuitive psychic guide specializing in tarot readings. Your words will be spoken aloud, so speak naturally and conversationally—avoid special characters, emojis, or bullet points that don't translate well to voice."
+            }
+        ],
+        task_messages=[
+            {
+                "role": "system",
+                "content": task_content
+            }
+        ],
+        functions=[recovery_function],
+    )
+
+
+def create_numerology_node(flow_manager: Optional[FlowManager] = None) -> NodeConfig:
+    """Create a skeleton node for numerology readings (Recommendation 7: Access State).
+    
+    Args:
+        flow_manager: Optional FlowManager to access state. If None, state will be
+                     accessed via function handlers.
+    
+    Returns:
+        NodeConfig for numerology reading flow
+    """
+    # Build personalized message using state if available
+    user_name = None
+    dob = None
+    dob_iso = None
+    if flow_manager:
+        user_name = flow_manager.state.get("full_name") or flow_manager.state.get("first_name")
+        dob = flow_manager.state.get("date_of_birth")
+        dob_iso = flow_manager.state.get("date_of_birth_iso")
+    
+    welcome_msg = "Welcome to your numerology reading"
+    if user_name:
+        welcome_msg = f"Welcome to your numerology reading, {user_name}"
+    
+    task_content = f"""{welcome_msg}. This is a skeleton node - you can begin the numerology reading process here."""
+    
+    if user_name and dob:
+        task_content += f" You know the user's name is {user_name} and their date of birth is {dob}."
+        if dob_iso:
+            task_content += f" The parsed date is {dob_iso} which you can use for calculations."
+        task_content += " Use this information to calculate their numerology numbers and provide insights."
+    elif user_name:
+        task_content += f" You know the user's name is {user_name}. Use this to calculate numerology numbers."
+    elif dob:
+        task_content += f" You know the user's date of birth is {dob}."
+        if dob_iso:
+            task_content += f" The parsed date is {dob_iso} which you can use for calculations."
+        task_content += " Use this for numerology calculations."
+    
+    recovery_function = FlowsFunctionSchema(
+        name="handle_recovery",
+        description="Use this if the user wants to start over or go back.",
+        required=["action"],
+        handler=handle_recovery,
+        properties={
+            "action": {
+                "type": "string",
+                "description": "The action the user wants: 'restart' or 'continue'"
+            }
+        },
+    )
+    
+    return NodeConfig(
+        name="numerology_reading",
+        role_messages=[
+            {
+                "role": "system",
+                "content": "You are Luna, a warm and intuitive psychic guide specializing in numerology readings. Your words will be spoken aloud, so speak naturally and conversationally—avoid special characters, emojis, or bullet points that don't translate well to voice."
+            }
+        ],
+        task_messages=[
+            {
+                "role": "system",
+                "content": task_content
+            }
+        ],
+        functions=[recovery_function],
+    )
+
+
+def create_astrology_node(flow_manager: Optional[FlowManager] = None) -> NodeConfig:
+    """Create a skeleton node for astrology readings (Recommendation 7: Access State).
+    
+    Args:
+        flow_manager: Optional FlowManager to access state. If None, state will be
+                     accessed via function handlers.
+    
+    Returns:
+        NodeConfig for astrology reading flow
+    """
+    # Build personalized message using state if available
+    user_name = None
+    dob = None
+    dob_iso = None
+    if flow_manager:
+        user_name = flow_manager.state.get("full_name") or flow_manager.state.get("first_name")
+        dob = flow_manager.state.get("date_of_birth")
+        dob_iso = flow_manager.state.get("date_of_birth_iso")
+    
+    welcome_msg = "Welcome to your astrology reading"
+    if user_name:
+        welcome_msg = f"Welcome to your astrology reading, {user_name}"
+    
+    task_content = f"""{welcome_msg}. This is a skeleton node - you can begin the astrology reading process here."""
+    
+    if user_name and dob:
+        task_content += f" You know the user's name is {user_name} and their date of birth is {dob}."
+        if dob_iso:
+            task_content += f" The parsed date is {dob_iso} which you can use to determine their astrological chart."
+        task_content += " Use this information to determine their astrological chart and provide insights."
+    elif user_name:
+        task_content += f" You know the user's name is {user_name}. Use this to personalize the reading."
+    elif dob:
+        task_content += f" You know the user's date of birth is {dob}."
+        if dob_iso:
+            task_content += f" The parsed date is {dob_iso} which you can use to determine their astrological chart."
+        task_content += " Use this to determine their astrological chart."
+    
+    recovery_function = FlowsFunctionSchema(
+        name="handle_recovery",
+        description="Use this if the user wants to start over or go back.",
+        required=["action"],
+        handler=handle_recovery,
+        properties={
+            "action": {
+                "type": "string",
+                "description": "The action the user wants: 'restart' or 'continue'"
+            }
+        },
+    )
+    
+    return NodeConfig(
+        name="astrology_reading",
+        role_messages=[
+            {
+                "role": "system",
+                "content": "You are Luna, a warm and intuitive psychic guide specializing in astrology readings. Your words will be spoken aloud, so speak naturally and conversationally—avoid special characters, emojis, or bullet points that don't translate well to voice."
+            }
+        ],
+        task_messages=[
+            {
+                "role": "system",
+                "content": task_content
+            }
+        ],
+        functions=[recovery_function],
+    )
+
 
 # We store functions so objects (e.g. SileroVADAnalyzer) don't get
 # instantiated. The function will be called when the desired transport gets
@@ -156,36 +963,17 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         #     logger.error("3. Network/API connectivity issues")
         #     raise
 
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a helpful assistant. Your output will be spoken aloud, so avoid special characters that can't easily be spoken, such as emojis or bullet points. Be succinct and respond to what the user said in a creative and helpful way.",
-            },
-        ]
-
+        # Initialize context for FlowManager
+        messages = []
         context = LLMContext(messages)
         context_aggregator = LLMContextAggregatorPair(context)
-
-        # Simple processor to log text messages (web UI should display them automatically)
-        class TextLogger(FrameProcessor):
-            async def process_frame(self, frame, direction):
-                if isinstance(frame, TranscriptionFrame):
-                    logger.info(f"👤 User said: {frame.text}")
-                elif isinstance(frame, TextFrame) and hasattr(frame, 'text'):
-                    logger.info(f"🤖 Bot said: {frame.text}")
-                # Always forward the frame
-                await self.push_frame(frame, direction)
-
-        text_logger = TextLogger()
 
         pipeline = Pipeline(
             [
                 transport.input(),  # Transport user input
                 stt,  # STT
-                text_logger,  # Log and display user transcriptions
                 context_aggregator.user(),  # User responses
                 llm,  # LLM
-                text_logger,  # Log and display bot responses
                 tts,  # TTS
                 # heygen,  # HeyGen avatar video - COMMENTED OUT
                 transport.output(),  # Transport bot output
@@ -200,6 +988,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
                 enable_usage_metrics=True,
             ),
             idle_timeout_secs=getattr(runner_args, "pipeline_idle_timeout_secs", None),
+        )
+
+        # Initialize FlowManager
+        flow_manager = FlowManager(
+            task=task,
+            llm=llm,
+            context_aggregator=context_aggregator,
+            transport=transport,
         )
 
         @transport.event_handler("on_client_connected")
@@ -222,14 +1018,21 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             except ImportError:
                 pass  # Daily transport not available
 
-            # Kick off the conversation.
-            messages.append(
-                {
-                    "role": "system",
-                    "content": "Start by saying 'Hello' and then a short greeting.",
-                }
-            )
-            await task.queue_frames([LLMRunFrame()])
+            # Extract user context if available (e.g., from client metadata)
+            user_name = None
+            if hasattr(client, "name") and client.name:
+                user_name = client.name
+            elif hasattr(client, "metadata") and isinstance(client.metadata, dict):
+                user_name = client.metadata.get("name") or client.metadata.get("user_name")
+            
+            # Store user context in FlowManager state for customization
+            if user_name:
+                flow_manager.state["user_name"] = user_name
+                logger.info(f"User name detected: {user_name}")
+            
+            # Initialize the conversation with the greeting node
+            greeting_node = create_greeting_node(user_name=user_name)
+            await flow_manager.initialize(greeting_node)
 
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(transport, client):
