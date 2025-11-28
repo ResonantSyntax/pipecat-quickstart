@@ -21,6 +21,8 @@ Run the bot using::
 """
 
 import os
+import json
+import random
 
 import aiohttp
 from dotenv import load_dotenv
@@ -113,6 +115,53 @@ def get_progress_message(flow_manager: FlowManager) -> str:
     if not collected:
         return "We haven't collected any information yet."
     return f"Great! I have your {', '.join(collected)}."
+
+
+# ============================================================================
+# Tarot Card Loading Utilities
+# ============================================================================
+
+def load_tarot_cards() -> list:
+    """Load tarot cards from JSON file.
+    
+    Returns:
+        List of card dictionaries with name, upright_core, reversed_core, and vibe
+    """
+    # Get the path to the tarot card JSON file
+    # Assuming the file is in spiritual_data/ relative to the bot.py location
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    json_path = os.path.join(script_dir, "..", "spiritual_data", "tarot_card_meanings.json")
+    
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            cards = json.load(f)
+        logger.info(f"Loaded {len(cards)} tarot cards from {json_path}")
+        return cards
+    except FileNotFoundError:
+        logger.error(f"Tarot card file not found at {json_path}")
+        return []
+    except json.JSONDecodeError as e:
+        logger.error(f"Error parsing tarot card JSON: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"Unexpected error loading tarot cards: {e}")
+        return []
+
+
+def pull_three_cards() -> list:
+    """Randomly select 3 cards from the tarot deck.
+    
+    Returns:
+        List of 3 card dictionaries
+    """
+    cards = load_tarot_cards()
+    if len(cards) < 3:
+        logger.warning(f"Not enough cards in deck ({len(cards)}). Need at least 3.")
+        return cards[:3] if cards else []
+    
+    selected = random.sample(cards, 3)
+    logger.info(f"Selected 3 cards: {[card['name'] for card in selected]}")
+    return selected
 
 
 # ============================================================================
@@ -298,6 +347,32 @@ async def confirm_reading_preference(
     
     # Transition to reading node
     return acknowledgment, next_node
+
+
+async def pull_tarot_cards_handler(
+    args: FlowArgs, flow_manager: FlowManager
+) -> tuple[str, Optional[NodeConfig]]:
+    """Pull 3 random tarot cards and store them in state.
+    
+    Args:
+        args: Not used, but required by handler signature
+        flow_manager: FlowManager instance for state management
+        
+    Returns:
+        Tuple of (result message, next node or None to stay in current node)
+    """
+    cards = pull_three_cards()
+    if not cards or len(cards) < 3:
+        error_msg = "I'm sorry, I couldn't load the tarot cards. Please try again later."
+        logger.error("Failed to pull tarot cards")
+        return error_msg, None
+    
+    # Store cards in state
+    flow_manager.state["tarot_cards"] = cards
+    logger.info(f"Pulled and stored 3 tarot cards: {[card['name'] for card in cards]}")
+    
+    # Return None for next node to stay in current node
+    return "Cards have been drawn.", None
 
 
 async def handle_recovery(
@@ -676,7 +751,7 @@ CRITICAL: When the user responds (yes, no, correct, wrong, change, etc.), you MU
 
 
 def create_tarot_node(flow_manager: Optional[FlowManager] = None) -> NodeConfig:
-    """Create a skeleton node for tarot readings (Recommendation 7: Access State).
+    """Create a tarot reading node that pulls 3 cards and provides a reading.
     
     Args:
         flow_manager: Optional FlowManager to access state. If None, state will be
@@ -692,18 +767,52 @@ def create_tarot_node(flow_manager: Optional[FlowManager] = None) -> NodeConfig:
         user_name = flow_manager.state.get("full_name") or flow_manager.state.get("first_name")
         dob = flow_manager.state.get("date_of_birth")
     
-    welcome_msg = "Welcome to your tarot reading"
-    if user_name:
-        welcome_msg = f"Welcome to your tarot reading, {user_name}"
-    
-    task_content = f"""{welcome_msg}. This is a skeleton node - you can begin the tarot reading process here."""
-    
-    if user_name and dob:
-        task_content += f" You know the user's name is {user_name} and their date of birth is {dob}. Use this information to personalize the reading."
-    elif user_name:
-        task_content += f" You know the user's name is {user_name}. Use this to personalize the reading."
-    elif dob:
-        task_content += f" You know the user's date of birth is {dob}. Use this information in the reading."
+    # Pull 3 random tarot cards
+    cards = pull_three_cards()
+    if not cards or len(cards) < 3:
+        logger.error("Failed to pull 3 tarot cards")
+        # Fallback message if cards can't be loaded
+        task_content = "I'm sorry, I'm having trouble loading the tarot cards right now. Please try again later."
+        if flow_manager:
+            flow_manager.state["tarot_cards"] = []
+    else:
+        # Store cards in state if flow_manager is available
+        if flow_manager:
+            flow_manager.state["tarot_cards"] = cards
+        
+        # Format card data for the LLM
+        card_descriptions = []
+        for i, card in enumerate(cards, 1):
+            card_desc = f"""Card {i}: {card['name']}
+Upright meaning: {card['upright_core']}
+Reversed meaning: {card['reversed_core']}
+Vibe: {card['vibe']}"""
+            card_descriptions.append(card_desc)
+        
+        cards_text = "\n\n".join(card_descriptions)
+        
+        # Build personalized welcome message
+        welcome_msg = "Welcome to your tarot reading"
+        if user_name:
+            welcome_msg = f"Welcome to your tarot reading, {user_name}"
+        
+        # Build task content with card data and instructions
+        task_content = f"""{welcome_msg}. I've drawn three cards for you. Here are the cards and their meanings:
+
+{cards_text}
+
+Your task is to:
+1. Name and describe each of the three cards in one sentence. Use the upright or reversed meaning based on what feels most appropriate for the reading context. You may choose upright or reversed for each card independently.
+2. After describing all three cards, provide a combined reading that explains how these three cards work together and what message they convey as a whole.
+
+Speak naturally and conversationally. Your words will be spoken aloud, so avoid special characters, emojis, or bullet points. Keep each card description to one sentence, then provide a thoughtful combined reading."""
+        
+        if user_name and dob:
+            task_content += f"\n\nYou know the user's name is {user_name} and their date of birth is {dob}. Use this information to personalize the reading if relevant."
+        elif user_name:
+            task_content += f"\n\nYou know the user's name is {user_name}. Use this to personalize the reading if relevant."
+        elif dob:
+            task_content += f"\n\nYou know the user's date of birth is {dob}. Use this information in the reading if relevant."
     
     recovery_function = FlowsFunctionSchema(
         name="handle_recovery",
@@ -723,7 +832,7 @@ def create_tarot_node(flow_manager: Optional[FlowManager] = None) -> NodeConfig:
         role_messages=[
             {
                 "role": "system",
-                "content": "You are Luna, a warm and intuitive psychic guide specializing in tarot readings. Your words will be spoken aloud, so speak naturally and conversationally—avoid special characters, emojis, or bullet points that don't translate well to voice."
+                "content": "You are Luna, a warm and intuitive psychic guide specializing in tarot readings. Your words will be spoken aloud, so speak naturally and conversationally—avoid special characters, emojis, or bullet points that don't translate well to voice. You only use the meanings provided in the card data. Do not quote the card data directly; expand the ideas naturally. Avoid mystical jargon, predictions, or fate-based statements. Stay reflective, symbolic, and emotionally gentle."
             }
         ],
         task_messages=[
@@ -919,11 +1028,44 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             voice_name=os.getenv("AZURE_TTS_VOICE", "en-US-NancyMultilingualNeural"),
         )
 
-        openai_key = os.getenv("OPENAI_API_KEY")
-        if not openai_key or openai_key == "your_openai_api_key":
-            raise ValueError("OPENAI_API_KEY is not set in environment variables. Please add it to your .env file.")
+        # Check which LLM provider to use
+        llm_provider = os.getenv("LLM_PROVIDER", "openai").lower()
         
-        llm = OpenAILLMService(api_key=openai_key)
+        if llm_provider == "vllm":
+            # Use hosted vLLM model
+            gpu_llm_base_url = os.getenv("GPU_LLM_BASE_URL")
+            gpu_llm_model = os.getenv("GPU_LLM_MODEL", "qwen2p5-1_5b")
+            gpu_llm_temperature = float(os.getenv("GPU_LLM_TEMPERATURE", "0.8"))
+            
+            if not gpu_llm_base_url:
+                raise ValueError("GPU_LLM_BASE_URL is not set in environment variables. Please add it to your .env file.")
+            
+            logger.info(f"Using vLLM model: {gpu_llm_model} at {gpu_llm_base_url}")
+            
+            # vLLM exposes OpenAI-compatible API, so we can use OpenAILLMService with custom base_url
+            # Use a dummy API key (vLLM typically doesn't require auth, but OpenAI client expects it)
+            # Note: vLLM server must be started with --enable-auto-tool-choice and --tool-call-parser flags
+            # If you get tool choice errors, you may need to configure the vLLM server with those flags
+            try:
+                llm = OpenAILLMService(
+                    api_key="dummy-key",  # vLLM doesn't require auth, but OpenAI client needs a key
+                    model=gpu_llm_model,
+                    base_url=gpu_llm_base_url,
+                    temperature=gpu_llm_temperature,
+                )
+            except Exception as e:
+                logger.error(f"Failed to initialize vLLM service: {e}")
+                logger.error("Note: vLLM server must be started with --enable-auto-tool-choice and --tool-call-parser flags")
+                logger.error("If you cannot modify the server, you may need to use a different LLM provider or configure the server")
+                raise
+        else:
+            # Default to OpenAI
+            openai_key = os.getenv("OPENAI_API_KEY")
+            if not openai_key or openai_key == "your_openai_api_key":
+                raise ValueError("OPENAI_API_KEY is not set in environment variables. Please add it to your .env file.")
+            
+            logger.info("Using OpenAI model")
+            llm = OpenAILLMService(api_key=openai_key)
 
         # HeyGen video service - COMMENTED OUT FOR NOW
         # heygen_key = os.getenv("HEYGEN_API_KEY")
